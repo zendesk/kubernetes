@@ -453,6 +453,7 @@ func Run(s *options.APIServer) error {
 			EnableSwaggerSupport:      true,
 			EnableProfiling:           s.EnableProfiling,
 			EnableWatchCache:          s.EnableWatchCache,
+			EnableAudit:               true, // FIXME, figure out where the config option for this should be
 			EnableIndex:               true,
 			APIPrefix:                 s.APIPrefix,
 			APIGroupPrefix:            s.APIGroupPrefix,

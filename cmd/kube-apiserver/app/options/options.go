@@ -55,6 +55,7 @@ type APIServer struct {
 	CorsAllowedOriginList      []string
 	DeleteCollectionWorkers    int
 	DeprecatedStorageVersion   string
+	EnableAudit                bool
 	EnableLogsSupport          bool
 	EnableProfiling            bool
 	EnableWatchCache           bool
@@ -99,6 +100,7 @@ func NewAPIServer() *APIServer {
 		AdmissionControl:        "AlwaysAdmit",
 		AuthorizationMode:       "AlwaysAllow",
 		DeleteCollectionWorkers: 1,
+		EnableAudit:             true,
 		EnableLogsSupport:       true,
 		EtcdConfig: etcdstorage.EtcdConfig{
 			Prefix: genericapiserver.DefaultEtcdPathPrefix,
@@ -240,6 +242,7 @@ func (s *APIServer) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&s.MasterServiceNamespace, "master-service-namespace", s.MasterServiceNamespace, "The namespace from which the kubernetes master services should be injected into pods")
 	fs.IntVar(&s.MasterCount, "apiserver-count", s.MasterCount, "The number of apiservers running in the cluster")
 	fs.IntVar(&s.DeleteCollectionWorkers, "delete-collection-workers", s.DeleteCollectionWorkers, "Number of workers spawned for DeleteCollection call. These are used to speed up namespace cleanup.")
+	fs.BoolVar(&s.EnableAudit, "audit", s.EnableAudit, "Enable audit logs showing all requests coming to the apiserver")
 	fs.Var(&s.RuntimeConfig, "runtime-config", "A set of key=value pairs that describe runtime configuration that may be passed to apiserver. apis/<groupVersion> key can be used to turn on/off specific api versions. apis/<groupVersion>/<resource> can be used to turn on/off specific resources. api/all and api/legacy are special keys to control all and legacy api versions respectively.")
 	fs.BoolVar(&s.EnableProfiling, "profiling", true, "Enable profiling via web interface host:port/debug/pprof/")
 	// TODO: enable cache in integration tests.

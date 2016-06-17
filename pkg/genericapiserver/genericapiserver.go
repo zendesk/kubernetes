@@ -35,6 +35,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/apimachinery"
 	"k8s.io/kubernetes/pkg/apiserver"
+	"k8s.io/kubernetes/pkg/apiserver/audit"
 	"k8s.io/kubernetes/pkg/auth/authenticator"
 	"k8s.io/kubernetes/pkg/auth/authorizer"
 	"k8s.io/kubernetes/pkg/auth/handlers"
@@ -206,6 +207,7 @@ type Config struct {
 	// StorageVersions is a map between groups and their storage versions
 	StorageVersions map[string]string
 	// allow downstream consumers to disable the core controller loops
+	EnableAudit       bool
 	EnableLogsSupport bool
 	EnableUISupport   bool
 	// allow downstream consumers to disable swagger
@@ -578,6 +580,11 @@ func (s *GenericAPIServer) init(c *Config) {
 
 	attributeGetter := apiserver.NewRequestAttributeGetter(s.RequestContextMapper, s.NewRequestInfoResolver())
 	handler = apiserver.WithAuthorizationCheck(handler, attributeGetter, s.authorizer)
+
+	// turn on the audit trail loggging
+	if c.EnableAudit {
+	  handler = audit.WithAudit(handler, s.RequestContextMapper)
+	}
 
 	// Install Authenticator
 	if c.Authenticator != nil {
