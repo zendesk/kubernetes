@@ -150,6 +150,9 @@ func GetClientIP(req *http.Request) net.IP {
 	}
 
 	// Fallback to Remote Address in request, which will give the correct client IP when there is no proxy.
-	ip := net.ParseIP(req.RemoteAddr)
-	return ip
+	// req.RemoteAddr is always in the form of IP:PORT, which net.ParseIP doesn't like
+	// hence the extra parsing
+	ip := strings.Split(req.RemoteAddr, ":")
+	ip_addr := net.ParseIP(ip[0])
+	return ip_addr
 }

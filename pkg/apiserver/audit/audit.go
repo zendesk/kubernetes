@@ -89,8 +89,8 @@ func WithAudit(handler http.Handler, requestContextMapper api.RequestContextMapp
 		}
 		id := uuid.NewRandom().String()
 
-		glog.Infof("AUDIT: id=%q ip=%q method=%q user=%q as=%q namespace=%q uri=%q remote_address=%q",
-			id, utilnet.GetClientIP(req), req.Method, user.GetName(), asuser, namespace, req.URL, req.RemoteAddr)
+		glog.Infof("AUDIT: id=%q ip=%q method=%q user=%q as=%q namespace=%q uri=%q",
+			id, utilnet.GetClientIP(req), req.Method, user.GetName(), asuser, namespace, req.URL)
 		handler.ServeHTTP(constructResponseWriter(w, id), req)
 	})
 }
