@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"io/ioutil"
 )
 
 type simpleResponseWriter struct {
@@ -41,7 +42,8 @@ func (*fancyResponseWriter) Flush() {}
 func (*fancyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }
 
 func TestConstructResponseWriter(t *testing.T) {
-	actual := constructResponseWriter(&simpleResponseWriter{}, "")
+	out := ioutil.Discard // Need something that's an io.Writer
+	actual := constructResponseWriter(&simpleResponseWriter{}, out, "whatever")
 	switch v := actual.(type) {
 	case *auditResponseWriter:
 		break
@@ -49,7 +51,7 @@ func TestConstructResponseWriter(t *testing.T) {
 		t.Errorf("Expected auditResponseWriter, got %v", reflect.TypeOf(v))
 	}
 
-	actual = constructResponseWriter(&fancyResponseWriter{}, "")
+	actual = constructResponseWriter(&fancyResponseWriter{}, out, "whatever")
 	switch v := actual.(type) {
 	case *fancyResponseWriterDelegator:
 		break
