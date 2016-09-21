@@ -1,0 +1,1647 @@
+From 5097a317470849cd5cc0254177cce19831a5b6f0 Mon Sep 17 00:00:00 2001
+From: Mooli Tayer <mtayer@redhat.com>
+Date: Mon, 29 Aug 2016 19:26:48 +0300
+Subject: [PATCH 1/2] Support k8s api discovery
+
+---
+ README.md                               |  29 +++++
+ lib/kubeclient.rb                       |  26 +----
+ lib/kubeclient/common.rb                | 164 ++++++++++++++++++++---------
+ test/cassettes/kubernetes_guestbook.yml |  35 +++++-
+ test/json/bindings_list.json            |  10 ++
+ test/json/config_map_list.json          |   9 ++
+ test/json/core_api_resource_list.json   | 181 ++++++++++++++++++++++++++++++++
+ test/json/pod_template_list.json        |   9 ++
+ test/test_common.rb                     |  28 -----
+ test/test_component_status.rb           |   6 ++
+ test/test_endpoint.rb                   |   6 +-
+ test/test_guestbook_go.rb               |   2 +-
+ test/test_kubeclient.rb                 |  75 +++++++++++--
+ test/test_limit_range.rb                |   4 +
+ test/test_missing_methods.rb            |  42 ++++++++
+ test/test_namespace.rb                  |  13 ++-
+ test/test_node.rb                       |   6 ++
+ test/test_persistent_volume.rb          |   6 ++
+ test/test_persistent_volume_claim.rb    |   6 ++
+ test/test_pod.rb                        |   6 ++
+ test/test_replication_controller.rb     |   3 +
+ test/test_resource_quota.rb             |   3 +
+ test/test_secret.rb                     |  14 ++-
+ test/test_service.rb                    |  45 ++++++--
+ test/test_service_account.rb            |   6 ++
+ test/test_watch.rb                      |  17 ++-
+ 26 files changed, 631 insertions(+), 120 deletions(-)
+ create mode 100644 test/json/bindings_list.json
+ create mode 100644 test/json/config_map_list.json
+ create mode 100644 test/json/core_api_resource_list.json
+ create mode 100644 test/json/pod_template_list.json
+ create mode 100644 test/test_missing_methods.rb
+
+diff --git a/README.md b/README.md
+index a27e7c8..a51d5a0 100644
+--- a/README.md
++++ b/README.md
+@@ -148,6 +148,23 @@ client = Kubeclient::Client.new('https://localhost:8443/api/',
+                                 :http_proxy_uri => proxy_uri)
+ ```
+ 
++### Discovery
++
++Discovery from the kube-apiserver is done lazily on method calls so it would not change behavior.
++
++It can also  be done explicitly:
++```
++client = Kubeclient::Client.new('http://localhost:8080/api', 'v1')
++client.discover
++```
++
++It is possible to check the status of discovery
++```
++unless client.discovered
++  client.discover
++end
++```
++
+ ### Kubeclient::Config
+ 
+ If you've been using `kubectl` and have a `.kube/config` file, you can auto-populate a config object using `Kubeclient::Config`:
+@@ -356,6 +373,18 @@ watcher.each do |line|
+ end
+ ```
+ 
++## Upgrading
++
++#### past version 1.2.0
++Replace Specific Entity class references:
++```ruby
++Kubeclient::Service
++```
++with the generic
++```ruby
++Kubeclient::Resource.new
++```
++Where ever possible.
+ 
+ ## Contributing
+ 
+diff --git a/lib/kubeclient.rb b/lib/kubeclient.rb
+index 7ecf716..35209e9 100644
+--- a/lib/kubeclient.rb
++++ b/lib/kubeclient.rb
+@@ -12,40 +12,20 @@ module Kubeclient
+   # Kubernetes Client
+   class Client
+     include ClientMixin
+-    # Dynamically creating classes definitions (class Pod, class Service, etc.),
+-    # The classes are extending RecursiveOpenStruct.
+-    # This cancels the need to define the classes
+-    # manually on every new entity addition,
+-    # and especially since currently the class body is empty
+-    ENTITY_TYPES = %w(Pod Service ReplicationController Node Event Endpoint
+-                      Namespace Secret ResourceQuota LimitRange PersistentVolume
+-                      PersistentVolumeClaim ComponentStatus ServiceAccount).map do |et|
+-      clazz = Class.new(RecursiveOpenStruct) do
+-        def initialize(hash = nil, args = {})
+-          args.merge!(recurse_over_arrays: true)
+-          super(hash, args)
+-        end
+-      end
+-      [Kubeclient.const_set(et, clazz), et]
+-    end
+-
+-    ClientMixin.define_entity_methods(ENTITY_TYPES)
+-
++    # define a multipurpose resource class, available before discovery
++    ClientMixin.resource_class(Kubeclient, 'Resource')
+     def initialize(
+       uri,
+       version = 'v1',
+       **options
+     )
+       initialize_client(
++        Kubeclient,
+         uri,
+         '/api',
+         version,
+         options
+       )
+     end
+-
+-    def all_entities
+-      retrieve_all_entities(ENTITY_TYPES)
+-    end
+   end
+ end
+diff --git a/lib/kubeclient/common.rb b/lib/kubeclient/common.rb
+index 722c700..3549b33 100644
+--- a/lib/kubeclient/common.rb
++++ b/lib/kubeclient/common.rb
+@@ -4,6 +4,8 @@ module Kubeclient
+   # Common methods
+   # this is mixed in by other gems
+   module ClientMixin
++    ENTITY_METHODS = %w(get watch delete create update patch)
++
+     DEFAULT_SSL_OPTIONS = {
+       client_cert: nil,
+       client_key:  nil,
+@@ -38,8 +40,10 @@ module ClientMixin
+     attr_reader :auth_options
+     attr_reader :http_proxy_uri
+     attr_reader :headers
++    attr_reader :discovered
+ 
+     def initialize_client(
++      class_owner,
+       uri,
+       path,
+       version,
+@@ -51,6 +55,9 @@ def initialize_client(
+       validate_auth_options(auth_options)
+       handle_uri(uri, path)
+ 
++      @class_owner = class_owner
++      @entities = {}
++      @discovered = false
+       @api_version = version
+       @headers = {}
+       @ssl_options = ssl_options
+@@ -66,6 +73,28 @@ def initialize_client(
+       end
+     end
+ 
++    def method_missing(method_sym, *args, &block)
++      if discovery_needed?(method_sym)
++        discover
++        send(method_sym, *args, &block)
++      else
++        super
++      end
++    end
++
++    def respond_to_missing?(method_sym, include_private = false)
++      if discovery_needed?(method_sym)
++        discover
++        respond_to?(method_sym, include_private)
++      else
++        super
++      end
++    end
++
++    def discovery_needed?(method_sym)
++      !@discovered && ENTITY_METHODS.any? { |x| method_sym.to_s.start_with?(x) }
++    end
++
+     def handle_exception
+       yield
+     rescue RestClient::Exception => e
+@@ -78,6 +107,37 @@ def handle_exception
+       raise KubeException.new(e.http_code, err_message, e.response)
+     end
+ 
++    def discover
++      @entities = {}
++      result = JSON.parse(handle_exception { rest_client.get(@headers) })
++      result['resources'].each do |resource|
++        next if resource['name'].include?('/')
++        entity = ClientMixin.parse_definition(resource['kind'], resource['name'])
++        @entities[entity.method_names[0]] = entity if entity
++      end
++      define_entity_methods
++      @discovered = true
++    end
++
++    def self.parse_definition(kind, name)
++      # "name": "componentstatuses", networkpolicies, endpoints
++      # "kind": "ComponentStatus" NetworkPolicy, Endpoints
++      # maintain pre group api compatibility for endpoints.
++      # See: https://github.com/kubernetes/kubernetes/issues/8115
++      kind = 'Endpoint' if kind == 'Endpoints'
++
++      prefix = kind[0..kind.rindex(/[A-Z]/)] # NetworkP
++      m = name.match(/^#{prefix.downcase}(.*)$/)
++      m && OpenStruct.new(
++        entity_type:   kind, # ComponentStatus
++        resource_name: name, # componentstatuses
++        method_names:  [
++          ClientMixin.underscore_entity(kind),         # component_status
++          ClientMixin.underscore_entity(prefix) + m[1] # component_statuses
++        ]
++      )
++    end
++
+     def handle_uri(uri, path)
+       fail ArgumentError, 'Missing uri' unless uri
+       @api_endpoint = (uri.is_a?(URI) ? uri : URI.parse(uri))
+@@ -91,52 +151,60 @@ def build_namespace_prefix(namespace)
+ 
+     public
+ 
+-    def self.define_entity_methods(entity_types)
+-      entity_types.each do |klass, entity_type|
+-        entity_name = underscore_entity(entity_type)
+-        entity_name_plural = pluralize_entity(entity_name)
++    def self.resource_class(class_owner, entity_type)
++      class_owner.const_get(entity_type, false)
++    rescue NameError
++      class_owner.const_set(
++        entity_type,
++        Class.new(RecursiveOpenStruct) do
++          def initialize(hash = nil, args = {})
++            args[:recurse_over_arrays] = true
++            super(hash, args)
++          end
++        end
++      )
++    end
+ 
++    def define_entity_methods
++      @entities.values.each do |entity|
++        klass = ClientMixin.resource_class(@class_owner, entity.entity_type)
+         # get all entities of a type e.g. get_nodes, get_pods, etc.
+-        define_method("get_#{entity_name_plural}") do |options = {}|
+-          get_entities(entity_type, klass, options)
++        define_singleton_method("get_#{entity.method_names[1]}") do |options = {}|
++          get_entities(entity.entity_type, klass, entity.resource_name, options)
+         end
+ 
+         # watch all entities of a type e.g. watch_nodes, watch_pods, etc.
+-        define_method("watch_#{entity_name_plural}") do |options = {}|
++        define_singleton_method("watch_#{entity.method_names[1]}") do |options = {}|
+           # This method used to take resource_version as a param, so
+           # this conversion is to keep backwards compatibility
+           options = { resource_version: options } unless options.is_a?(Hash)
+ 
+-          watch_entities(entity_type, options)
++          watch_entities(entity.resource_name, options)
+         end
+ 
+         # get a single entity of a specific type by name
+-        define_method("get_#{entity_name}") do |name, namespace = nil|
+-          get_entity(entity_type, klass, name, namespace)
++        define_singleton_method("get_#{entity.method_names[0]}") do |name, namespace = nil|
++          get_entity(klass, entity.resource_name, name, namespace)
+         end
+ 
+-        define_method("delete_#{entity_name}") do |name, namespace = nil|
+-          delete_entity(entity_type, name, namespace)
++        define_singleton_method("delete_#{entity.method_names[0]}") do |name, namespace = nil|
++          delete_entity(entity.resource_name, name, namespace)
+         end
+ 
+-        define_method("create_#{entity_name}") do |entity_config|
+-          create_entity(entity_type, entity_config, klass)
++        define_singleton_method("create_#{entity.method_names[0]}") do |entity_config|
++          create_entity(entity.entity_type, entity.resource_name, entity_config, klass)
+         end
+ 
+-        define_method("update_#{entity_name}") do |entity_config|
+-          update_entity(entity_type, entity_config)
++        define_singleton_method("update_#{entity.method_names[0]}") do |entity_config|
++          update_entity(entity.resource_name, entity_config)
+         end
+ 
+-        define_method("patch_#{entity_name}") do |name, patch, namespace = nil|
+-          patch_entity(entity_type, name, patch, namespace)
++        define_singleton_method("patch_#{entity.method_names[0]}") do |name, patch, namespace = nil|
++          patch_entity(entity.resource_name, name, patch, namespace)
+         end
+       end
+     end
+ 
+-    def self.pluralize_entity(entity_name)
+-      "#{entity_name}#{entity_name.end_with?('s') ? 'es' : 's'}"
+-    end
+-
+     def self.underscore_entity(entity_name)
+       entity_name.gsub(/([a-z])([A-Z])/, '\1_\2').downcase
+     end
+@@ -168,10 +236,10 @@ def rest_client
+     #   :label_selector - a selector to restrict the list of returned objects by their labels.
+     #   :field_selector - a selector to restrict the list of returned objects by their fields.
+     #   :resource_version - shows changes that occur after that particular version of a resource.
+-    def watch_entities(entity_type, options = {})
++    def watch_entities(resource_name, options = {})
+       ns = build_namespace_prefix(options[:namespace])
+ 
+-      path = "watch/#{ns}#{resource_name(entity_type.to_s)}"
++      path = "watch/#{ns}#{resource_name}"
+       path += "/#{options[:name]}" if options[:name]
+       uri = @api_endpoint.merge("#{@api_endpoint.path}/#{@api_version}/#{path}")
+ 
+@@ -186,13 +254,13 @@ def watch_entities(entity_type, options = {})
+     #   :namespace - the namespace of the entity.
+     #   :label_selector - a selector to restrict the list of returned objects by their labels.
+     #   :field_selector - a selector to restrict the list of returned objects by their fields.
+-    def get_entities(entity_type, klass, options = {})
++    def get_entities(entity_type, klass, resource_name, options = {})
+       params = {}
+       SEARCH_ARGUMENTS.each { |k, v| params[k] = options[v] if options[v] }
+ 
+       ns_prefix = build_namespace_prefix(options[:namespace])
+       response = handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type)]
++        rest_client[ns_prefix + resource_name]
+         .get({ 'params' => params }.merge(@headers))
+       end
+ 
+@@ -210,25 +278,25 @@ def get_entities(entity_type, klass, options = {})
+       Kubeclient::Common::EntityList.new(entity_type, resource_version, collection)
+     end
+ 
+-    def get_entity(entity_type, klass, name, namespace = nil)
++    def get_entity(klass, resource_name, name, namespace = nil)
+       ns_prefix = build_namespace_prefix(namespace)
+       response = handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type) + "/#{name}"]
++        rest_client[ns_prefix + resource_name + "/#{name}"]
+         .get(@headers)
+       end
+       result = JSON.parse(response)
+       new_entity(result, klass)
+     end
+ 
+-    def delete_entity(entity_type, name, namespace = nil)
++    def delete_entity(resource_name, name, namespace = nil)
+       ns_prefix = build_namespace_prefix(namespace)
+       handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type) + "/#{name}"]
++        rest_client[ns_prefix + resource_name + "/#{name}"]
+           .delete(@headers)
+       end
+     end
+ 
+-    def create_entity(entity_type, entity_config, klass)
++    def create_entity(entity_type, resource_name, entity_config, klass)
+       # Duplicate the entity_config to a hash so that when we assign
+       # kind and apiVersion, this does not mutate original entity_config obj.
+       hash = entity_config.to_hash
+@@ -241,35 +309,35 @@ def create_entity(entity_type, entity_config, klass)
+       # TODO: #2 solution for
+       # https://github.com/kubernetes/kubernetes/issues/8115
+       if entity_type.eql? 'Endpoint'
+-        hash[:kind] = resource_name(entity_type).capitalize
++        hash[:kind] = 'Endpoints'
+       else
+         hash[:kind] = entity_type
+       end
+       hash[:apiVersion] = @api_version
+       @headers['Content-Type'] = 'application/json'
+       response = handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type)]
++        rest_client[ns_prefix + resource_name]
+         .post(hash.to_json, @headers)
+       end
+       result = JSON.parse(response)
+       new_entity(result, klass)
+     end
+ 
+-    def update_entity(entity_type, entity_config)
++    def update_entity(resource_name, entity_config)
+       name      = entity_config[:metadata][:name]
+       ns_prefix = build_namespace_prefix(entity_config[:metadata][:namespace])
+       @headers['Content-Type'] = 'application/json'
+       handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type) + "/#{name}"]
++        rest_client[ns_prefix + resource_name + "/#{name}"]
+           .put(entity_config.to_h.to_json, @headers)
+       end
+     end
+ 
+-    def patch_entity(entity_type, name, patch, namespace = nil)
++    def patch_entity(resource_name, name, patch, namespace = nil)
+       ns_prefix = build_namespace_prefix(namespace)
+       @headers['Content-Type'] = 'application/strategic-merge-patch+json'
+       handle_exception do
+-        rest_client[ns_prefix + resource_name(entity_type) + "/#{name}"]
++        rest_client[ns_prefix + resource_name + "/#{name}"]
+           .patch(patch.to_json, @headers)
+       end
+     end
+@@ -278,14 +346,17 @@ def new_entity(hash, klass)
+       klass.new(hash)
+     end
+ 
+-    def retrieve_all_entities(entity_types)
+-      entity_types.each_with_object({}) do |(_, entity_type), result_hash|
++    def all_entities
++      discover unless @discovered
++      @entities.values.each_with_object({}) do |entity, result_hash|
+         # method call for get each entities
+         # build hash of entity name to array of the entities
+-        entity_name = ClientMixin.pluralize_entity(ClientMixin.underscore_entity(entity_type))
+-        method_name = "get_#{entity_name}"
+-        key_name = ClientMixin.underscore_entity(entity_type)
+-        result_hash[key_name] = send(method_name)
++        method_name = "get_#{entity.method_names[1]}"
++        begin
++          result_hash[entity.method_names[0]] = send(method_name)
++        rescue KubeException
++          next # do not fail due to resources not supporting get
++        end
+       end
+     end
+ 
+@@ -317,10 +388,11 @@ def watch_pod_log(pod_name, namespace, container: nil)
+     end
+ 
+     def proxy_url(kind, name, port, namespace = '')
++      discover unless @discovered
+       entity_name_plural = if %w(services pods nodes).include?(kind.to_s)
+                              kind.to_s
+                            else
+-                             ClientMixin.pluralize_entity(kind.to_s)
++                             @entities[kind.to_s].resource_name
+                            end
+       ns_prefix = build_namespace_prefix(namespace)
+       # TODO: Change this once services supports the new scheme
+@@ -331,10 +403,6 @@ def proxy_url(kind, name, port, namespace = '')
+       end
+     end
+ 
+-    def resource_name(entity_type)
+-      ClientMixin.pluralize_entity entity_type.downcase
+-    end
+-
+     def api_valid?
+       result = api
+       result.is_a?(Hash) && (result['versions'] || []).include?(@api_version)
+diff --git a/test/cassettes/kubernetes_guestbook.yml b/test/cassettes/kubernetes_guestbook.yml
+index 4277492..3829add 100644
+--- a/test/cassettes/kubernetes_guestbook.yml
++++ b/test/cassettes/kubernetes_guestbook.yml
+@@ -843,4 +843,37 @@ http_interactions:
+       string: '{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"kubeclient-ns","selfLink":"/api/v1/namespaces/kubeclient-ns","uid":"f41e6b27-3e7d-11e5-a75a-18037327aaeb","resourceVersion":"584","creationTimestamp":"2015-08-09T10:03:59Z","deletionTimestamp":"2015-08-09T10:03:59Z"},"spec":{"finalizers":["kubernetes"]},"status":{"phase":"Terminating"}}'
+     http_version: 
+   recorded_at: Sun, 09 Aug 2015 10:00:02 GMT
+-recorded_with: VCR 2.9.3
++- request:
++    method: get
++    uri: http://10.35.0.23:8080/api/v1
++    body:
++      encoding: US-ASCII
++      string: ''
++    headers:
++      Accept:
++      - "*/*"
++      Accept-Encoding:
++      - gzip, deflate
++      User-Agent:
++      - rest-client/2.0.0 (linux-gnu x86_64) ruby/2.3.0p0
++      Host:
++      - localhost:8080
++  response:
++    status:
++      code: 200
++      message: OK
++    headers:
++      Content-Type:
++      - application/json
++      Date:
++      - Mon, 29 Aug 2016 15:51:30 GMT
++      Transfer-Encoding:
++      - chunked
++    body:
++      encoding: UTF-8
++      string: '{"kind":"APIResourceList","groupVersion":"v1","resources":[{"name":"bindings","namespaced":true,"kind":"Binding"},{"name":"componentstatuses","namespaced":false,"kind":"ComponentStatus"},{"name":"configmaps","namespaced":true,"kind":"ConfigMap"},{"name":"endpoints","namespaced":true,"kind":"Endpoints"},{"name":"events","namespaced":true,"kind":"Event"},{"name":"limitranges","namespaced":true,"kind":"LimitRange"},{"name":"namespaces","namespaced":false,"kind":"Namespace"},{"name":"namespaces/finalize","namespaced":false,"kind":"Namespace"},{"name":"namespaces/status","namespaced":false,"kind":"Namespace"},{"name":"nodes","namespaced":false,"kind":"Node"},{"name":"nodes/proxy","namespaced":false,"kind":"Node"},{"name":"nodes/status","namespaced":false,"kind":"Node"},{"name":"persistentvolumeclaims","namespaced":true,"kind":"PersistentVolumeClaim"},{"name":"persistentvolumeclaims/status","namespaced":true,"kind":"PersistentVolumeClaim"},{"name":"persistentvolumes","namespaced":false,"kind":"PersistentVolume"},{"name":"persistentvolumes/status","namespaced":false,"kind":"PersistentVolume"},{"name":"pods","namespaced":true,"kind":"Pod"},{"name":"pods/attach","namespaced":true,"kind":"Pod"},{"name":"pods/binding","namespaced":true,"kind":"Binding"},{"name":"pods/exec","namespaced":true,"kind":"Pod"},{"name":"pods/log","namespaced":true,"kind":"Pod"},{"name":"pods/portforward","namespaced":true,"kind":"Pod"},{"name":"pods/proxy","namespaced":true,"kind":"Pod"},{"name":"pods/status","namespaced":true,"kind":"Pod"},{"name":"podtemplates","namespaced":true,"kind":"PodTemplate"},{"name":"replicationcontrollers","namespaced":true,"kind":"ReplicationController"},{"name":"replicationcontrollers/scale","namespaced":true,"kind":"Scale"},{"name":"replicationcontrollers/status","namespaced":true,"kind":"ReplicationController"},{"name":"resourcequotas","namespaced":true,"kind":"ResourceQuota"},{"name":"resourcequotas/status","namespaced":true,"kind":"ResourceQuota"},{"name":"secrets","namespaced":true,"kind":"Secret"},{"name":"serviceaccounts","namespaced":true,"kind":"ServiceAccount"},{"name":"services","namespaced":true,"kind":"Service"},{"name":"services/proxy","namespaced":true,"kind":"Service"},{"name":"services/status","namespaced":true,"kind":"Service"}]}
++
++'
++    http_version: 
++  recorded_at: Mon, 29 Aug 2016 15:51:30 GMT
++recorded_with: VCR 3.0.3
+diff --git a/test/json/bindings_list.json b/test/json/bindings_list.json
+new file mode 100644
+index 0000000..260748c
+--- /dev/null
++++ b/test/json/bindings_list.json
+@@ -0,0 +1,10 @@
++{
++  "kind": "Status",
++  "apiVersion": "v1",
++  "metadata": {},
++  "status": "Failure",
++  "message": "the server could not find the requested resource",
++  "reason": "NotFound",
++  "details": {},
++  "code": 404
++}
+\ No newline at end of file
+diff --git a/test/json/config_map_list.json b/test/json/config_map_list.json
+new file mode 100644
+index 0000000..85e0e30
+--- /dev/null
++++ b/test/json/config_map_list.json
+@@ -0,0 +1,9 @@
++{
++  "kind": "ConfigMapList",
++  "apiVersion": "v1",
++  "metadata": {
++    "selfLink": "/api/v1/configmaps",
++    "resourceVersion": "665"
++  },
++  "items": []
++}
+\ No newline at end of file
+diff --git a/test/json/core_api_resource_list.json b/test/json/core_api_resource_list.json
+new file mode 100644
+index 0000000..395acb2
+--- /dev/null
++++ b/test/json/core_api_resource_list.json
+@@ -0,0 +1,181 @@
++{
++  "kind": "APIResourceList",
++  "groupVersion": "v1",
++  "resources": [
++    {
++      "name": "bindings",
++      "namespaced": true,
++      "kind": "Binding"
++    },
++    {
++      "name": "componentstatuses",
++      "namespaced": false,
++      "kind": "ComponentStatus"
++    },
++    {
++      "name": "configmaps",
++      "namespaced": true,
++      "kind": "ConfigMap"
++    },
++    {
++      "name": "endpoints",
++      "namespaced": true,
++      "kind": "Endpoints"
++    },
++    {
++      "name": "events",
++      "namespaced": true,
++      "kind": "Event"
++    },
++    {
++      "name": "limitranges",
++      "namespaced": true,
++      "kind": "LimitRange"
++    },
++    {
++      "name": "namespaces",
++      "namespaced": false,
++      "kind": "Namespace"
++    },
++    {
++      "name": "namespaces/finalize",
++      "namespaced": false,
++      "kind": "Namespace"
++    },
++    {
++      "name": "namespaces/status",
++      "namespaced": false,
++      "kind": "Namespace"
++    },
++    {
++      "name": "nodes",
++      "namespaced": false,
++      "kind": "Node"
++    },
++    {
++      "name": "nodes/proxy",
++      "namespaced": false,
++      "kind": "Node"
++    },
++    {
++      "name": "nodes/status",
++      "namespaced": false,
++      "kind": "Node"
++    },
++    {
++      "name": "persistentvolumeclaims",
++      "namespaced": true,
++      "kind": "PersistentVolumeClaim"
++    },
++    {
++      "name": "persistentvolumeclaims/status",
++      "namespaced": true,
++      "kind": "PersistentVolumeClaim"
++    },
++    {
++      "name": "persistentvolumes",
++      "namespaced": false,
++      "kind": "PersistentVolume"
++    },
++    {
++      "name": "persistentvolumes/status",
++      "namespaced": false,
++      "kind": "PersistentVolume"
++    },
++    {
++      "name": "pods",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/attach",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/binding",
++      "namespaced": true,
++      "kind": "Binding"
++    },
++    {
++      "name": "pods/exec",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/log",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/portforward",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/proxy",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "pods/status",
++      "namespaced": true,
++      "kind": "Pod"
++    },
++    {
++      "name": "podtemplates",
++      "namespaced": true,
++      "kind": "PodTemplate"
++    },
++    {
++      "name": "replicationcontrollers",
++      "namespaced": true,
++      "kind": "ReplicationController"
++    },
++    {
++      "name": "replicationcontrollers/scale",
++      "namespaced": true,
++      "kind": "Scale"
++    },
++    {
++      "name": "replicationcontrollers/status",
++      "namespaced": true,
++      "kind": "ReplicationController"
++    },
++    {
++      "name": "resourcequotas",
++      "namespaced": true,
++      "kind": "ResourceQuota"
++    },
++    {
++      "name": "resourcequotas/status",
++      "namespaced": true,
++      "kind": "ResourceQuota"
++    },
++    {
++      "name": "secrets",
++      "namespaced": true,
++      "kind": "Secret"
++    },
++    {
++      "name": "serviceaccounts",
++      "namespaced": true,
++      "kind": "ServiceAccount"
++    },
++    {
++      "name": "services",
++      "namespaced": true,
++      "kind": "Service"
++    },
++    {
++      "name": "services/proxy",
++      "namespaced": true,
++      "kind": "Service"
++    },
++    {
++      "name": "services/status",
++      "namespaced": true,
++      "kind": "Service"
++    }
++  ]
++}
+diff --git a/test/json/pod_template_list.json b/test/json/pod_template_list.json
+new file mode 100644
+index 0000000..5acb2c2
+--- /dev/null
++++ b/test/json/pod_template_list.json
+@@ -0,0 +1,9 @@
++{
++  "kind": "PodTemplateList",
++  "apiVersion": "v1",
++  "metadata": {
++    "selfLink": "/api/v1/podtemplates",
++    "resourceVersion": "672"
++  },
++  "items": []
++}
+\ No newline at end of file
+diff --git a/test/test_common.rb b/test/test_common.rb
+index 83918e9..f235928 100644
+--- a/test/test_common.rb
++++ b/test/test_common.rb
+@@ -2,34 +2,6 @@
+ 
+ # Unit tests for the common module
+ class CommonTest < MiniTest::Test
+-  def test_pluralize_entity
+-    %w(
+-      Pod Pods
+-      Service Services
+-      ReplicationController ReplicationControllers
+-      Node Nodes
+-      Event Events
+-      Endpoint Endpoints
+-      Namespace Namespaces
+-      Secret Secrets
+-      ResourceQuota ResourceQuotas
+-      LimitRange LimitRanges
+-      PersistentVolume PersistentVolumes
+-      PersistentVolumeClaim PersistentVolumeClaims
+-      ComponentStatus ComponentStatuses
+-      ServiceAccount ServiceAccounts
+-      Project Projects
+-      Route Routes
+-      ClusterRoleBinding ClusterRoleBindings
+-      Build Builds
+-      BuildConfig BuildConfigs
+-      Image Images
+-      ImageStream ImageStreams
+-    ).each_slice(2) do |singular, plural|
+-      assert_equal(Kubeclient::ClientMixin.pluralize_entity(singular), plural)
+-    end
+-  end
+-
+   def test_underscore_entity
+     %w(
+       Pod pod
+diff --git a/test/test_component_status.rb b/test/test_component_status.rb
+index b46e417..d768939 100644
+--- a/test/test_component_status.rb
++++ b/test/test_component_status.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v3
+     stub_request(:get, %r{/componentstatuses})
+       .to_return(body: open_test_file('component_status.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     component_status = client.get_component_status 'etcd-0', 'default'
+@@ -16,6 +19,9 @@ def test_get_from_json_v3
+     assert_equal('True', component_status.conditions[0].status)
+ 
+     assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
++    assert_requested(:get,
+                      'http://localhost:8080/api/v1/namespaces/default/componentstatuses/etcd-0',
+                      times: 1)
+   end
+diff --git a/test/test_endpoint.rb b/test/test_endpoint.rb
+index 852f5a0..87ddb5b 100644
+--- a/test/test_endpoint.rb
++++ b/test/test_endpoint.rb
+@@ -3,8 +3,12 @@
+ # Endpoint entity tests
+ class TestEndpoint < MiniTest::Test
+   def test_create_endpoint
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+-    testing_ep = Kubeclient::Endpoint.new
++    testing_ep = Kubeclient::Resource.new
+     testing_ep.metadata = {}
+     testing_ep.metadata.name = 'myendpoint'
+     testing_ep.metadata.namespace = 'default'
+diff --git a/test/test_guestbook_go.rb b/test/test_guestbook_go.rb
+index 4cc92b1..4ffc3ac 100644
+--- a/test/test_guestbook_go.rb
++++ b/test/test_guestbook_go.rb
+@@ -13,7 +13,7 @@ def test_create_guestbook_entities
+     VCR.use_cassette('kubernetes_guestbook') do # , record: :new_episodes) do
+       client = Kubeclient::Client.new 'http://10.35.0.23:8080/api/', 'v1'
+ 
+-      testing_ns = Kubeclient::Namespace.new
++      testing_ns = Kubeclient::Resource.new
+       testing_ns.metadata = {}
+       testing_ns.metadata.name = 'kubeclient-ns'
+ 
+diff --git a/test/test_kubeclient.rb b/test/test_kubeclient.rb
+index 67118d1..08513e1 100644
+--- a/test/test_kubeclient.rb
++++ b/test/test_kubeclient.rb
+@@ -3,7 +3,7 @@
+ # Kubernetes client entity tests
+ class KubeClientTest < MiniTest::Test
+   def test_json
+-    our_object = Kubeclient::Service.new
++    our_object = Kubeclient::Resource.new
+     our_object.foo = 'bar'
+     our_object.nested = {}
+     our_object.nested.again = {}
+@@ -41,6 +41,10 @@ def test_no_version_passed
+   def test_pass_proxy
+     uri = URI::HTTP.build(host: 'localhost', port: 8080)
+     proxy_uri = URI::HTTP.build(host: 'myproxyhost', port: 8888)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     client = Kubeclient::Client.new(uri, http_proxy_uri: proxy_uri)
+     rest_client = client.rest_client
+     assert_equal proxy_uri.to_s, rest_client.options[:proxy]
+@@ -51,11 +55,14 @@ def test_pass_proxy
+   end
+ 
+   def test_exception
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:post, %r{/services})
+       .to_return(body: open_test_file('namespace_exception.json'),
+                  status: 409)
+ 
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     service.metadata = {}
+     service.metadata.name = 'redisslave'
+     service.metadata.namespace = 'default'
+@@ -149,6 +156,9 @@ def test_api_valid_with_non_json
+   end
+ 
+   def test_nonjson_exception
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/servic})
+       .to_return(body: open_test_file('service_illegal_json_404.json'),
+                  status: 404)
+@@ -165,6 +175,9 @@ def test_nonjson_exception
+   end
+ 
+   def test_entity_list
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/services})
+       .to_return(body: open_test_file('entity_list.json'),
+                  status: 200)
+@@ -187,6 +200,9 @@ def test_entity_list
+   def test_entities_with_label_selector
+     selector = 'component=apiserver'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/services})
+       .to_return(body: open_test_file('entity_list.json'),
+                  status: 200)
+@@ -203,6 +219,9 @@ def test_entities_with_label_selector
+   def test_entities_with_field_selector
+     selector = 'involvedObject.name=redis-master'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/services})
+       .to_return(body: open_test_file('entity_list.json'),
+                  status: 200)
+@@ -217,6 +236,9 @@ def test_entities_with_field_selector
+   end
+ 
+   def test_empty_list
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/pods})
+       .to_return(body: open_test_file('empty_pod_list.json'),
+                  status: 200)
+@@ -228,6 +250,22 @@ def test_empty_list
+   end
+ 
+   def test_get_all
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
++    stub_request(:get, %r{/bindings})
++      .to_return(body: open_test_file('bindings_list.json'),
++                 status: 404)
++
++    stub_request(:get, %r{/configmaps})
++      .to_return(body: open_test_file('config_map_list.json'),
++                 status: 200)
++
++    stub_request(:get, %r{/podtemplates})
++      .to_return(body: open_test_file('pod_template_list.json'),
++                 status: 200)
++
+     stub_request(:get, %r{/services})
+       .to_return(body: open_test_file('service_list.json'),
+                  status: 200)
+@@ -284,7 +322,7 @@ def test_get_all
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     result = client.all_entities
+-    assert_equal(14, result.keys.size)
++    assert_equal(16, result.keys.size)
+     assert_instance_of(Kubeclient::Common::EntityList, result['node'])
+     assert_instance_of(Kubeclient::Common::EntityList, result['service'])
+     assert_instance_of(Kubeclient::Common::EntityList,
+@@ -312,6 +350,10 @@ def test_api_bearer_token_with_params_success
+       .with(headers: { Authorization: 'Bearer valid_token' })
+       .to_return(body: open_test_file('pod_list.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .with(headers: { Authorization: 'Bearer valid_token' })
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/',
+                                     auth_options: {
+@@ -325,6 +367,9 @@ def test_api_bearer_token_with_params_success
+   end
+ 
+   def test_api_bearer_token_success
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, 'http://localhost:8080/api/v1/pods')
+       .with(headers: { Authorization: 'Bearer valid_token' })
+       .to_return(body: open_test_file('pod_list.json'),
+@@ -342,11 +387,11 @@ def test_api_bearer_token_success
+   end
+ 
+   def test_api_bearer_token_failure
+-    error_message = '"/api/v1/pods" is forbidden because ' \
++    error_message = '"/api/v1" is forbidden because ' \
+                     'system:anonymous cannot list on pods in'
+     response = OpenStruct.new(code: 401, message: error_message)
+ 
+-    stub_request(:get, 'http://localhost:8080/api/v1/pods')
++    stub_request(:get, 'http://localhost:8080/api/v1')
+       .with(headers: { Authorization: 'Bearer invalid_token' })
+       .to_raise(KubeException.new(403, error_message, response))
+ 
+@@ -362,6 +407,9 @@ def test_api_bearer_token_failure
+   end
+ 
+   def test_api_basic_auth_success
++    stub_request(:get, 'http://username:password@localhost:8080/api/v1')
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, 'http://username:password@localhost:8080/api/v1/pods')
+       .to_return(body: open_test_file('pod_list.json'),
+                  status: 200)
+@@ -382,6 +430,9 @@ def test_api_basic_auth_success
+   end
+ 
+   def test_api_basic_auth_back_comp_success
++    stub_request(:get, 'http://username:password@localhost:8080/api/v1')
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, 'http://username:password@localhost:8080/api/v1/pods')
+       .to_return(body: open_test_file('pod_list.json'),
+                  status: 200)
+@@ -405,7 +456,7 @@ def test_api_basic_auth_failure
+     error_message = 'HTTP status code 401, 401 Unauthorized'
+     response = OpenStruct.new(code: 401, message: '401 Unauthorized')
+ 
+-    stub_request(:get, 'http://username:password@localhost:8080/api/v1/pods')
++    stub_request(:get, 'http://username:password@localhost:8080/api/v1')
+       .to_raise(KubeException.new(401, error_message, response))
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/',
+@@ -419,7 +470,7 @@ def test_api_basic_auth_failure
+     assert_equal(error_message, exception.message)
+     assert_equal(response, exception.response)
+     assert_requested(:get,
+-                     'http://username:password@localhost:8080/api/v1/pods',
++                     'http://username:password@localhost:8080/api/v1',
+                      times: 1)
+   end
+ 
+@@ -496,6 +547,9 @@ def test_bearer_token_file_not_exist
+   end
+ 
+   def test_api_bearer_token_file_success
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, 'http://localhost:8080/api/v1/pods')
+       .with(headers: { Authorization: 'Bearer valid_token' })
+       .to_return(body: open_test_file('pod_list.json'),
+@@ -514,6 +568,10 @@ def test_api_bearer_token_file_success
+   end
+ 
+   def test_proxy_url
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     client = Kubeclient::Client.new 'http://host:8080', 'v1'
+     assert_equal('http://host:8080/api/v1/proxy/namespaces/ns/services/srvname:srvportname',
+                  client.proxy_url('service', 'srvname', 'srvportname', 'ns'))
+@@ -558,6 +616,9 @@ def test_attr_readers
+ 
+   def test_nil_items
+     # handle https://github.com/kubernetes/kubernetes/issues/13096
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/persistentvolumeclaims})
+       .to_return(body: open_test_file('persistent_volume_claims_nil_items.json'),
+                  status: 200)
+diff --git a/test/test_limit_range.rb b/test/test_limit_range.rb
+index 805a7ef..e258a48 100644
+--- a/test/test_limit_range.rb
++++ b/test/test_limit_range.rb
+@@ -3,6 +3,10 @@
+ # LimitRange tests
+ class TestLimitRange < MiniTest::Test
+   def test_get_from_json_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:get, %r{/limitranges})
+       .to_return(body: open_test_file('limit_range.json'),
+                  status: 200)
+diff --git a/test/test_missing_methods.rb b/test/test_missing_methods.rb
+new file mode 100644
+index 0000000..17cf83a
+--- /dev/null
++++ b/test/test_missing_methods.rb
+@@ -0,0 +1,42 @@
++require 'test_helper'
++
++# Test method_missing, respond_to? and respond_to_missing behaviour
++class TestMissingMethods < MiniTest::Test
++  def test_missing
++    stub_request(:get, %r{/api/v1$}).to_return(
++      body: open_test_file('core_api_resource_list.json'),
++      status: 200
++    )
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1')
++    assert_equal(true, client.respond_to?(:get_pod))
++    assert_equal(true, client.respond_to?(:get_pods))
++    assert_equal(false, client.respond_to?(:get_pie))
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1') # Reset discovery
++    assert_equal(false, client.respond_to?(:get_pie))
++    assert_equal(true, client.respond_to?(:get_pods))
++    assert_equal(true, client.respond_to?(:get_pod))
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1') # Reset discovery
++    assert_instance_of(Method, client.method(:get_pods))
++    assert_raises(NameError) do
++      client.method(:get_pies)
++    end
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1') # Reset discovery
++    assert_raises(NameError) do
++      client.method(:get_pies)
++    end
++    assert_instance_of(Method, client.method(:get_pods))
++
++    stub_request(:get, %r{/api/v1$}).to_return(
++      body: '',
++      status: 404
++    ) # If discovery fails we expect the below raise an exception
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1')
++    assert_raises(KubeException) do
++      client.method(:get_pods)
++    end
++    client = Kubeclient::Client.new('http://localhost:8080/api/', 'v1')
++    assert_raises(KubeException) do
++      client.respond_to?(:get_pods)
++    end
++  end
++end
+diff --git a/test/test_namespace.rb b/test/test_namespace.rb
+index 4e79487..57183d0 100644
+--- a/test/test_namespace.rb
++++ b/test/test_namespace.rb
+@@ -3,6 +3,9 @@
+ # Namespace entity tests
+ class TestNamespace < MiniTest::Test
+   def test_get_namespace_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/namespaces})
+       .to_return(body: open_test_file('namespace.json'),
+                  status: 200)
+@@ -22,10 +25,13 @@ def test_get_namespace_v1
+   end
+ 
+   def test_delete_namespace_v1
+-    our_namespace = Kubeclient::Namespace.new
++    our_namespace = Kubeclient::Resource.new
+     our_namespace.metadata = {}
+     our_namespace.metadata.name = 'staging'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:delete, %r{/namespaces})
+       .to_return(status: 200)
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+@@ -37,11 +43,14 @@ def test_delete_namespace_v1
+   end
+ 
+   def test_create_namespace
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:post, %r{/namespaces})
+       .to_return(body: open_test_file('created_namespace.json'),
+                  status: 201)
+ 
+-    namespace = Kubeclient::Namespace.new
++    namespace = Kubeclient::Resource.new
+     namespace.metadata = {}
+     namespace.metadata.name = 'development'
+ 
+diff --git a/test/test_node.rb b/test/test_node.rb
+index 601d9f8..ea209b8 100644
+--- a/test/test_node.rb
++++ b/test/test_node.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v1
+     stub_request(:get, %r{/nodes})
+       .to_return(body: open_test_file('node.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     node = client.get_node('127.0.0.1')
+@@ -19,6 +22,9 @@ def test_get_from_json_v1
+     assert_equal('2015-03-19T15:08:20+02:00', node.metadata.creationTimestamp)
+ 
+     assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
++    assert_requested(:get,
+                      'http://localhost:8080/api/v1/nodes/127.0.0.1',
+                      times: 1)
+   end
+diff --git a/test/test_persistent_volume.rb b/test/test_persistent_volume.rb
+index d9850c1..03ca7a6 100644
+--- a/test/test_persistent_volume.rb
++++ b/test/test_persistent_volume.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v1
+     stub_request(:get, %r{/persistentvolumes})
+       .to_return(body: open_test_file('persistent_volume.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     volume = client.get_persistent_volume 'pv0001'
+@@ -16,6 +19,9 @@ def test_get_from_json_v1
+     assert_equal('/tmp/data01', volume.spec.hostPath.path)
+ 
+     assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
++    assert_requested(:get,
+                      'http://localhost:8080/api/v1/persistentvolumes/pv0001',
+                      times: 1)
+   end
+diff --git a/test/test_persistent_volume_claim.rb b/test/test_persistent_volume_claim.rb
+index 94d278a..efe98d5 100644
+--- a/test/test_persistent_volume_claim.rb
++++ b/test/test_persistent_volume_claim.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v1
+     stub_request(:get, %r{/persistentvolumeclaims})
+       .to_return(body: open_test_file('persistent_volume_claim.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     claim = client.get_persistent_volume_claim 'myclaim-1', 'default'
+@@ -16,6 +19,9 @@ def test_get_from_json_v1
+     assert_equal('pv0001', claim.spec.volumeName)
+ 
+     assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
++    assert_requested(:get,
+                      'http://localhost:8080/api/v1/namespaces/default/persistentvolumeclaims/myclaim-1',
+                      times: 1)
+   end
+diff --git a/test/test_pod.rb b/test/test_pod.rb
+index c078842..d657033 100644
+--- a/test/test_pod.rb
++++ b/test/test_pod.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v1
+     stub_request(:get, %r{/pods})
+       .to_return(body: open_test_file('pod.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     pod = client.get_pod 'redis-master-pod', 'default'
+@@ -15,6 +18,9 @@ def test_get_from_json_v1
+     assert_equal('dockerfile/redis', pod.spec.containers[0]['image'])
+ 
+     assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
++    assert_requested(:get,
+                      'http://localhost:8080/api/v1/namespaces/default/pods/redis-master-pod',
+                      times: 1)
+   end
+diff --git a/test/test_replication_controller.rb b/test/test_replication_controller.rb
+index fbe1ca8..0dbd242 100644
+--- a/test/test_replication_controller.rb
++++ b/test/test_replication_controller.rb
+@@ -3,6 +3,9 @@
+ # Replication Controller entity tests
+ class TestReplicationController < MiniTest::Test
+   def test_get_from_json_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/replicationcontrollers})
+       .to_return(body: open_test_file('replication_controller.json'),
+                  status: 200)
+diff --git a/test/test_resource_quota.rb b/test/test_resource_quota.rb
+index 385eace..7d8ab73 100644
+--- a/test/test_resource_quota.rb
++++ b/test/test_resource_quota.rb
+@@ -3,6 +3,9 @@
+ # ResourceQuota tests
+ class TestResourceQuota < MiniTest::Test
+   def test_get_from_json_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/resourcequotas})
+       .to_return(body: open_test_file('resource_quota.json'),
+                  status: 200)
+diff --git a/test/test_secret.rb b/test/test_secret.rb
+index f6af824..cc635d4 100644
+--- a/test/test_secret.rb
++++ b/test/test_secret.rb
+@@ -3,6 +3,10 @@
+ # Namespace entity tests
+ class TestSecret < MiniTest::Test
+   def test_get_secret_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:get, %r{/secrets})
+       .to_return(body: open_test_file('created_secret.json'),
+                  status: 200)
+@@ -22,6 +26,10 @@ def test_get_secret_v1
+   end
+ 
+   def test_delete_secret_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:delete, %r{/secrets})
+       .to_return(status: 200)
+ 
+@@ -34,11 +42,15 @@ def test_delete_secret_v1
+   end
+ 
+   def test_create_secret_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:post, %r{/secrets})
+       .to_return(body: open_test_file('created_secret.json'),
+                  status: 201)
+ 
+-    secret = Kubeclient::Secret.new
++    secret = Kubeclient::Resource.new
+     secret.metadata = {}
+     secret.metadata.name = 'test-secret'
+     secret.metadata.namespace = 'dev'
+diff --git a/test/test_service.rb b/test/test_service.rb
+index fcb09bf..2c88e4d 100644
+--- a/test/test_service.rb
++++ b/test/test_service.rb
+@@ -3,7 +3,7 @@
+ # Service entity tests
+ class TestService < MiniTest::Test
+   def test_construct_our_own_service
+-    our_service = Kubeclient::Service.new
++    our_service = Kubeclient::Resource.new
+     our_service.metadata = {}
+     our_service.metadata.name = 'guestbook'
+     our_service.metadata.namespace = 'staging'
+@@ -24,6 +24,10 @@ def test_construct_our_own_service
+                  hash[:metadata][:labels][:name]
+ 
+     expected_url = 'http://localhost:8080/api/v1/namespaces/staging/services'
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:post, expected_url)
+       .to_return(body: open_test_file('created_service.json'), status: 201)
+ 
+@@ -47,7 +51,7 @@ def test_construct_our_own_service
+   end
+ 
+   def test_construct_service_from_symbol_keys
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     service.metadata = {
+       labels: { tier: 'frontend' },
+       name: 'test-service',
+@@ -62,6 +66,9 @@ def test_construct_service_from_symbol_keys
+     }
+ 
+     expected_url = 'http://localhost:8080/api/v1/namespaces/staging/services'
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:post, expected_url)
+       .to_return(body: open_test_file('created_service.json'), status: 201)
+ 
+@@ -79,7 +86,7 @@ def test_construct_service_from_symbol_keys
+   end
+ 
+   def test_construct_service_from_string_keys
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     service.metadata = {
+       'labels' => { 'tier' => 'frontend' },
+       'name' => 'test-service',
+@@ -93,6 +100,9 @@ def test_construct_service_from_string_keys
+       }]
+     }
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     expected_url = 'http://localhost:8080/api/v1/namespaces/staging/services'
+     stub_request(:post, %r{namespaces/staging/services})
+       .to_return(body: open_test_file('created_service.json'), status: 201)
+@@ -111,6 +121,9 @@ def test_construct_service_from_string_keys
+   end
+ 
+   def test_conversion_from_json_v1
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/services})
+       .to_return(body: open_test_file('service.json'),
+                  status: 200)
+@@ -139,13 +152,16 @@ def test_conversion_from_json_v1
+   end
+ 
+   def test_delete_service
+-    our_service = Kubeclient::Service.new
++    our_service = Kubeclient::Resource.new
+     our_service.name = 'redis-service'
+     # TODO, new ports assignment to be added
+     our_service.labels = {}
+     our_service.labels.component = 'apiserver'
+     our_service.labels.provider = 'kubernetes'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:delete, %r{/namespaces/default/services})
+       .to_return(status: 200)
+ 
+@@ -158,6 +174,9 @@ def test_delete_service
+   end
+ 
+   def test_get_service_no_ns
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     # when not specifying namespace for entities which
+     # are not node or namespace, the request will fail
+     stub_request(:get, %r{/services/redis-slave})
+@@ -172,6 +191,9 @@ def test_get_service_no_ns
+   end
+ 
+   def test_get_service
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{/namespaces/development/services/redis-slave})
+       .to_return(body: open_test_file('service.json'),
+                  status: 200)
+@@ -186,13 +208,16 @@ def test_get_service
+   end
+ 
+   def test_update_service
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     name = 'my_service'
+ 
+     service.metadata = {}
+     service.metadata.name      = name
+     service.metadata.namespace = 'development'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     expected_url = "http://localhost:8080/api/v1/namespaces/development/services/#{name}"
+     stub_request(:put, expected_url)
+       .to_return(body: open_test_file('service_update.json'), status: 201)
+@@ -208,7 +233,7 @@ def test_update_service
+   end
+ 
+   def test_update_service_with_string_keys
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     name = 'my_service'
+ 
+     service.metadata = {
+@@ -216,6 +241,9 @@ def test_update_service_with_string_keys
+       'namespace' => 'development'
+     }
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     expected_url = "http://localhost:8080/api/v1/namespaces/development/services/#{name}"
+     stub_request(:put, expected_url)
+       .to_return(body: open_test_file('service_update.json'), status: 201)
+@@ -231,13 +259,16 @@ def test_update_service_with_string_keys
+   end
+ 
+   def test_patch_service
+-    service = Kubeclient::Service.new
++    service = Kubeclient::Resource.new
+     name = 'my_service'
+ 
+     service.metadata = {}
+     service.metadata.name      = name
+     service.metadata.namespace = 'development'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     expected_url = "http://localhost:8080/api/v1/namespaces/development/services/#{name}"
+     stub_request(:patch, expected_url)
+       .to_return(body: open_test_file('service_patch.json'), status: 200)
+diff --git a/test/test_service_account.rb b/test/test_service_account.rb
+index e071a2b..1c463ef 100644
+--- a/test/test_service_account.rb
++++ b/test/test_service_account.rb
+@@ -6,6 +6,9 @@ def test_get_from_json_v1
+     stub_request(:get, %r{/serviceaccounts})
+       .to_return(body: open_test_file('service_account.json'),
+                  status: 200)
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+     account = client.get_service_account 'default'
+@@ -18,5 +21,8 @@ def test_get_from_json_v1
+     assert_requested(:get,
+                      'http://localhost:8080/api/v1/serviceaccounts/default',
+                      times: 1)
++    assert_requested(:get,
++                     'http://localhost:8080/api/v1',
++                     times: 1)
+   end
+ end
+diff --git a/test/test_watch.rb b/test/test_watch.rb
+index 0c17781..a68fd4c 100644
+--- a/test/test_watch.rb
++++ b/test/test_watch.rb
+@@ -9,6 +9,10 @@ def test_watch_pod_success
+       { 'type' => 'DELETED', 'resourceVersion' => '1398' }
+     ]
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
++
+     stub_request(:get, %r{.*\/watch/pods})
+       .to_return(body: open_test_file('watch_stream.json'),
+                  status: 200)
+@@ -26,6 +30,9 @@ def test_watch_pod_success
+   end
+ 
+   def test_watch_pod_failure
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{.*\/watch/pods}).to_return(status: 404)
+ 
+     client = Kubeclient::Client.new 'http://localhost:8080/api/', 'v1'
+@@ -54,7 +61,9 @@ def test_watch_stream_text
+   def test_watch_with_resource_version
+     api_host = 'http://localhost:8080/api'
+     version = '1995'
+-
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{.*\/watch/events})
+       .to_return(body: open_test_file('watch_stream.json'),
+                  status: 200)
+@@ -72,6 +81,9 @@ def test_watch_with_label_selector
+     api_host = 'http://localhost:8080/api'
+     selector = 'name=redis-master'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{.*\/watch/events})
+       .to_return(body: open_test_file('watch_stream.json'),
+                  status: 200)
+@@ -89,6 +101,9 @@ def test_watch_with_field_selector
+     api_host = 'http://localhost:8080/api'
+     selector = 'involvedObject.kind=Pod'
+ 
++    stub_request(:get, %r{/api/v1$})
++      .to_return(body: open_test_file('core_api_resource_list.json'),
++                 status: 200)
+     stub_request(:get, %r{.*\/watch/events})
+       .to_return(body: open_test_file('watch_stream.json'),
+                  status: 200)
+
+From f33d601a9e77c935e6c5bbcce39efddcf60fd95a Mon Sep 17 00:00:00 2001
+From: Mooli Tayer <mtayer@redhat.com>
+Date: Mon, 29 Aug 2016 19:31:45 +0300
+Subject: [PATCH 2/2] Support k8s group api
+
+---
+ README.md                | 6 ++++++
+ lib/kubeclient/common.rb | 8 ++++++--
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index a51d5a0..377f366 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,12 @@ Or without specifying version (it will be set by default to "v1")
+ client = Kubeclient::Client.new 'http://localhost:8080/api/'
+ ```
+ 
++For A Group Api:
++
++```ruby
++client = Kubeclient::Client.new('http://localhost:8080/apis/batch', 'v1')
++```
++
+ Another option is to initialize the client with URI object:
+ 
+ ```ruby
+diff --git a/lib/kubeclient/common.rb b/lib/kubeclient/common.rb
+index 3549b33..d2f44af 100644
+--- a/lib/kubeclient/common.rb
++++ b/lib/kubeclient/common.rb
+@@ -143,6 +143,8 @@ def handle_uri(uri, path)
+       @api_endpoint = (uri.is_a?(URI) ? uri : URI.parse(uri))
+       @api_endpoint.path = path if @api_endpoint.path.empty?
+       @api_endpoint.path = @api_endpoint.path.chop if @api_endpoint.path.end_with? '/'
++      components = @api_endpoint.path.to_s.split('/') # ["", "api"] or ["", "apis", batch]
++      @api_group = components.length > 2 ? components[2] + '/' : ''
+     end
+ 
+     def build_namespace_prefix(namespace)
+@@ -313,7 +315,7 @@ def create_entity(entity_type, resource_name, entity_config, klass)
+       else
+         hash[:kind] = entity_type
+       end
+-      hash[:apiVersion] = @api_version
++      hash[:apiVersion] = @api_group + @api_version
+       @headers['Content-Type'] = 'application/json'
+       response = handle_exception do
+         rest_client[ns_prefix + resource_name]
+@@ -405,7 +407,9 @@ def proxy_url(kind, name, port, namespace = '')
+ 
+     def api_valid?
+       result = api
+-      result.is_a?(Hash) && (result['versions'] || []).include?(@api_version)
++      result.is_a?(Hash) && (result['versions'] || []).any? do |group|
++        @api_group.empty? ? group.include?(@api_version) : group['version'] == (@api_version)
++      end
+     end
+ 
+     def api
