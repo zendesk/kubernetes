@@ -18,6 +18,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"net"
 	"net/http"
 	"reflect"
@@ -41,7 +42,10 @@ func (*fancyResponseWriter) Flush() {}
 func (*fancyResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }
 
 func TestConstructResponseWriter(t *testing.T) {
-	actual := constructResponseWriter(&simpleResponseWriter{}, "")
+	// just need something here that implements io.Writer
+	out := bytes.NewBufferString("foo")
+
+	actual := constructResponseWriter(&simpleResponseWriter{}, out, "bar")
 	switch v := actual.(type) {
 	case *auditResponseWriter:
 		break
@@ -49,7 +53,7 @@ func TestConstructResponseWriter(t *testing.T) {
 		t.Errorf("Expected auditResponseWriter, got %v", reflect.TypeOf(v))
 	}
 
-	actual = constructResponseWriter(&fancyResponseWriter{}, "")
+	actual = constructResponseWriter(&fancyResponseWriter{}, out, "bar")
 	switch v := actual.(type) {
 	case *fancyResponseWriterDelegator:
 		break
